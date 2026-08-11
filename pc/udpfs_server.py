@@ -289,6 +289,16 @@ class UdpfsServer:
                  enable_compression: bool = False,
                  compression_cache_size: int = 32):
         self.root_dir = os.path.realpath(root_dir) if root_dir else None
+        # persistent uncompressed-size cache (see _get_compressed_stat)
+        self._size_cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'size-cache.json')
+        self._size_cache = {}
+        self._size_cache_dirty = 0
+        try:
+            import json as _json
+            with open(self._size_cache_path, 'r') as _f:
+                self._size_cache = _json.load(_f)
+        except Exception:
+            pass
         self.port = port
         self.bind_ip = bind_ip
         self.sector_size = sector_size
@@ -504,6 +514,15 @@ class UdpfsServer:
 
         return resolved
 
+    def _save_size_cache(self):
+        try:
+            import json as _json
+            with open(self._size_cache_path, 'w') as _f:
+                _json.dump(self._size_cache, _f)
+            self._size_cache_dirty = 0
+        except Exception:
+            pass
+
     def _transform_compressed_name(self, name: str) -> str:
         """Transform .zso/.cso/.chd extensions to .iso for directory listing."""
         if not self.enable_compression:
@@ -527,12 +546,24 @@ class UdpfsServer:
         return None
 
     def _get_compressed_stat(self, file_path: str, original_stat) -> Optional[dict]:
-        """Get stat info for a compressed file, returning uncompressed size."""
-        info = get_compressed_info(file_path)
-        if info is None:
-            return None
-        
-        uncompressed_size, format_name = info
+        """Get stat info for a compressed file, returning uncompressed size.
+
+        Cached persistently by (mtime, filesize): CHD headers cost ~60ms each to
+        parse, which made listing an 800-CHD folder take ~45s per boot."""
+        key = file_path
+        sig = [int(original_stat.st_mtime), int(original_stat.st_size)]
+        ent = self._size_cache.get(key)
+        if ent is not None and ent[0] == sig[0] and ent[1] == sig[1]:
+            uncompressed_size = ent[2]
+        else:
+            info = get_compressed_info(file_path)
+            if info is None:
+                return None
+            uncompressed_size, _fmt = info
+            self._size_cache[key] = [sig[0], sig[1], uncompressed_size]
+            self._size_cache_dirty += 1
+            if self._size_cache_dirty >= 25:
+                self._save_size_cache()
         return {
             'mode': FIO_S_IFREG,
             'attr': 0,
